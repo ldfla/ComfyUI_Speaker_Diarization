@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import itertools
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
@@ -9,7 +13,7 @@ from typing import Dict, List, Tuple
 import torch
 import torchaudio
 from comfy import model_management as mm
-from pyannote.audio import Pipeline
+
 
 @dataclass(frozen=True)
 class Segment:
@@ -23,20 +27,17 @@ class Segment:
 
 class SpeakerDiarizerChronoNode:
     """
-    Speaker diarization for ComfyUI with chronological output ordering.
+    ComfyUI node that isolates up to 5 speakers in chronological order
+    using an external pyannote.audio 4.x worker.
 
     Output mapping:
     - speaker_1_audio = first unique speaker to speak
     - speaker_2_audio = second unique speaker to speak
     - ...
     - speaker_5_audio = fifth unique speaker to speak
-
-    Designed for telephony/call-center scenarios where there may be up to 5
-    distinct voices including IVR/URA prompts.
     """
 
     MAX_OUTPUT_SPEAKERS = 5
-    TARGET_SAMPLE_RATE = 16000
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -48,17 +49,14 @@ class SpeakerDiarizerChronoNode:
                     {
                         "default": "",
                         "multiline": False,
-                        "tooltip": (
-                            "Hugging Face access token for pyannote. "
-                            "Required for gated model access."
-                        ),
+                        "tooltip": "Hugging Face token for pyannote community-1",
                     },
                 ),
                 "device": (
                     ["auto", "cuda", "cpu"],
                     {
                         "default": "auto",
-                        "tooltip": "Compute device used by pyannote pipeline",
+                        "tooltip": "Device used by the external pyannote worker",
                     },
                 ),
                 "min_speakers": (
@@ -68,7 +66,7 @@ class SpeakerDiarizerChronoNode:
                         "min": 1,
                         "max": 5,
                         "step": 1,
-                        "tooltip": "Minimum expected number of speakers",
+                        "tooltip": "Minimum expected speakers",
                     },
                 ),
                 "max_speakers": (
@@ -78,7 +76,7 @@ class SpeakerDiarizerChronoNode:
                         "min": 1,
                         "max": 5,
                         "step": 1,
-                        "tooltip": "Maximum expected number of speakers",
+                        "tooltip": "Maximum expected speakers",
                     },
                 ),
                 "merge_gap_ms": (
@@ -88,21 +86,40 @@ class SpeakerDiarizerChronoNode:
                         "min": 0,
                         "max": 5000,
                         "step": 50,
-                        "tooltip": (
-                            "Merge adjacent segments of the same speaker when the gap "
-                            "between them is less than or equal to this value"
-                        ),
+                        "tooltip": "Merge adjacent same-speaker segments up to this gap",
                     },
                 ),
                 "keep_only_detected_speakers": (
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": (
-                            "If true, only diarized regions are kept in each speaker output. "
-                            "If false, output remains isolated by speaker but preserves "
-                            "timeline silence everywhere else anyway."
-                        ),
+                        "tooltip": "Kept for compatibility. Output is timeline-preserving.",
+                    },
+                ),
+                "pyannote_python": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "Absolute path to Python executable of the external pyannote environment",
+                    },
+                ),
+                "worker_script": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "Absolute path to pyannote_worker.py",
+                    },
+                ),
+                "timeout_seconds": (
+                    "INT",
+                    {
+                        "default": 600,
+                        "min": 30,
+                        "max": 7200,
+                        "step": 30,
+                        "tooltip": "Timeout for the external worker",
                     },
                 ),
             }
@@ -127,18 +144,10 @@ class SpeakerDiarizerChronoNode:
 
     @staticmethod
     def _round3(value: float) -> float:
-        """Round to 3 decimal places without using built-in round (Pyre2 compat)."""
         return int(float(value) * 1000 + 0.5) / 1000
 
     @staticmethod
     def _normalize_waveform_shape(waveform: torch.Tensor) -> torch.Tensor:
-        """
-        Convert ComfyUI audio waveform to mono 1D tensor.
-        Expected possible shapes:
-        - (B, C, S)
-        - (C, S)
-        - (S,)
-        """
         if waveform.ndim == 3:  # (B, C, S)
             return waveform[0].mean(dim=0)
         if waveform.ndim == 2:  # (C, S)
@@ -148,17 +157,22 @@ class SpeakerDiarizerChronoNode:
         raise ValueError(f"Unsupported waveform shape: {tuple(waveform.shape)}")
 
     @classmethod
-    def _make_audio_output(cls, waveform_1d: torch.Tensor, sample_rate: int) -> Dict[str, torch.Tensor | int]:
-        """
-        ComfyUI AUDIO format typically expects shape (B, C, S).
-        """
+    def _make_audio_output(
+        cls,
+        waveform_1d: torch.Tensor,
+        sample_rate: int,
+    ) -> Dict[str, torch.Tensor | int]:
         return {
             "waveform": waveform_1d.unsqueeze(0).unsqueeze(0),
             "sample_rate": sample_rate,
         }
 
     @classmethod
-    def _make_silent_output(cls, reference_waveform_1d: torch.Tensor, sample_rate: int) -> Dict[str, torch.Tensor | int]:
+    def _make_silent_output(
+        cls,
+        reference_waveform_1d: torch.Tensor,
+        sample_rate: int,
+    ) -> Dict[str, torch.Tensor | int]:
         silent = torch.zeros_like(reference_waveform_1d)
         return cls._make_audio_output(silent, sample_rate)
 
@@ -191,31 +205,17 @@ class SpeakerDiarizerChronoNode:
         )
 
     @staticmethod
-    def _select_device(device: str) -> torch.device:
+    def _select_device(device: str) -> str:
         if device == "auto":
-            return mm.get_torch_device()
+            torch_device = mm.get_torch_device()
+            return "cuda" if str(torch_device).startswith("cuda") else "cpu"
+
         if device == "cuda":
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA foi solicitado, mas não está disponível.")
-            return torch.device("cuda")
-        return torch.device("cpu")
+            return "cuda"
 
-    @classmethod
-    def _resample_if_needed(
-        cls,
-        waveform_1d: torch.Tensor,
-        sample_rate: int,
-    ) -> Tuple[torch.Tensor, int]:
-        if sample_rate == cls.TARGET_SAMPLE_RATE:
-            return waveform_1d, sample_rate
-
-        cls._log(f"Resampling {sample_rate}Hz -> {cls.TARGET_SAMPLE_RATE}Hz")
-        resampler = torchaudio.transforms.Resample(
-            orig_freq=sample_rate,
-            new_freq=cls.TARGET_SAMPLE_RATE,
-        )
-        resampled = resampler(waveform_1d)
-        return resampled, cls.TARGET_SAMPLE_RATE
+        return "cpu"
 
     @staticmethod
     def _merge_segments(segments: List[Segment], max_gap_seconds: float) -> List[Segment]:
@@ -261,24 +261,75 @@ class SpeakerDiarizerChronoNode:
         return isolated
 
     @staticmethod
-    def _annotation_to_segments_map(diarization) -> Dict[str, List[Segment]]:
-        speaker_segments: Dict[str, List[Segment]] = {}
+    def _validate_external_paths(pyannote_python: str, worker_script: str) -> None:
+        if not pyannote_python.strip():
+            raise ValueError("O campo pyannote_python está vazio.")
+        if not worker_script.strip():
+            raise ValueError("O campo worker_script está vazio.")
+        if not os.path.isfile(pyannote_python):
+            raise FileNotFoundError(f"Python externo não encontrado: {pyannote_python}")
+        if not os.path.isfile(worker_script):
+            raise FileNotFoundError(f"Worker script não encontrado: {worker_script}")
 
-        for turn, _, label in diarization.itertracks(yield_label=True):
-            speaker_segments.setdefault(str(label), []).append(
-                Segment(start=float(turn.start), end=float(turn.end))
+    @classmethod
+    def _call_external_worker(
+        cls,
+        wav_path: str,
+        json_path: str,
+        pyannote_python: str,
+        worker_script: str,
+        hf_token: str,
+        device: str,
+        min_speakers: int,
+        max_speakers: int,
+        timeout_seconds: int,
+    ) -> Dict[str, object]:
+        cls._validate_external_paths(pyannote_python, worker_script)
+
+        command = [
+            pyannote_python,
+            worker_script,
+            "--input-wav",
+            wav_path,
+            "--output-json",
+            json_path,
+            "--hf-token",
+            hf_token,
+            "--device",
+            device,
+            "--min-speakers",
+            str(min_speakers),
+            "--max-speakers",
+            str(max_speakers),
+        ]
+
+        cls._log("Executing external pyannote worker")
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+
+        if completed.stdout:
+            cls._log("Worker stdout:\n" + completed.stdout)
+        if completed.stderr:
+            cls._log("Worker stderr:\n" + completed.stderr)
+
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"External worker failed with exit code {completed.returncode}.\n"
+                f"STDOUT:\n{completed.stdout}\n\nSTDERR:\n{completed.stderr}"
             )
 
-        return speaker_segments
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"Worker did not create output JSON: {json_path}")
 
-    @staticmethod
-    def _chronological_order(speaker_segments: Dict[str, List[Segment]]) -> List[str]:
-        first_starts = {
-            label: min(seg.start for seg in segments)
-            for label, segments in speaker_segments.items()
-            if segments
-        }
-        return sorted(first_starts.keys(), key=lambda label: first_starts[label])
+        with open(json_path, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+
+        return payload
 
     @classmethod
     def diarize_audio(
@@ -290,6 +341,9 @@ class SpeakerDiarizerChronoNode:
         max_speakers: int,
         merge_gap_ms: int,
         keep_only_detected_speakers: bool,
+        pyannote_python: str,
+        worker_script: str,
+        timeout_seconds: int,
     ):
         cls._log("Starting diarization node")
 
@@ -313,8 +367,8 @@ class SpeakerDiarizerChronoNode:
             except RuntimeError as thread_error:
                 cls._log(f"Warning while limiting torch threads: {thread_error}")
 
-            processing_device = cls._select_device(device)
-            cls._log(f"Using device: {processing_device}")
+            external_device = cls._select_device(device)
+            cls._log(f"Using external worker device: {external_device}")
 
             original_sample_rate = int(audio["sample_rate"])
             original_waveform = cls._normalize_waveform_shape(audio["waveform"]).detach().cpu()  # type: ignore[index]
@@ -322,51 +376,68 @@ class SpeakerDiarizerChronoNode:
                 f"Original waveform shape: {tuple(original_waveform.shape)} @ {original_sample_rate}Hz"
             )
 
-            diar_waveform, diar_sample_rate = cls._resample_if_needed(
-                original_waveform,
-                original_sample_rate,
-            )
+            with tempfile.TemporaryDirectory(prefix="comfyui_pyannote_") as temp_dir:
+                wav_path = os.path.join(temp_dir, "input.wav")
+                json_path = os.path.join(temp_dir, "segments.json")
 
-            audio_for_diarization = {
-                "waveform": diar_waveform.unsqueeze(0),
-                "sample_rate": diar_sample_rate,
-            }
+                torchaudio.save(
+                    wav_path,
+                    original_waveform.unsqueeze(0).to(torch.float32),
+                    sample_rate=original_sample_rate,
+                )
+                cls._log(f"Temporary WAV written to: {wav_path}")
 
-            cls._log("Loading pyannote pipeline")
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=hf_token,
-            )
-            pipeline.to(processing_device)
+                payload = cls._call_external_worker(
+                    wav_path=wav_path,
+                    json_path=json_path,
+                    pyannote_python=pyannote_python,
+                    worker_script=worker_script,
+                    hf_token=hf_token,
+                    device=external_device,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers,
+                    timeout_seconds=timeout_seconds,
+                )
 
-            cls._log(
-                f"Running pipeline with min_speakers={min_speakers}, max_speakers={max_speakers}"
-            )
-            diarization = pipeline(
-                audio_for_diarization,
-                min_speakers=min_speakers,
-                max_speakers=max_speakers,
-            )
+            raw_speakers = payload.get("speakers", [])
+            if not isinstance(raw_speakers, list) or not raw_speakers:
+                return cls._silent_outputs(
+                    audio,
+                    "No speakers detected by external pyannote worker.",
+                )
 
-            speaker_segments = cls._annotation_to_segments_map(diarization)
-            if not speaker_segments:
-                return cls._silent_outputs(audio, "No speakers detected by diarization pipeline.")
+            speakers_to_process: list[dict[str, object]] = list(
+                itertools.islice(
+                    (s for s in raw_speakers if isinstance(s, dict)),
+                    cls.MAX_OUTPUT_SPEAKERS,
+                )
+            )
 
             max_gap_seconds = merge_gap_ms / 1000.0
-            merged_segments_map: Dict[str, List[Segment]] = {
-                label: cls._merge_segments(segments, max_gap_seconds)
-                for label, segments in speaker_segments.items()
-            }
+            outputs: list[dict[str, torch.Tensor | int]] = []
+            summary_items: list[str] = []
+            json_items: list[dict[str, object]] = []
 
-            ordered_labels = cls._chronological_order(merged_segments_map)
-            cls._log(f"Detected speakers: {ordered_labels}")
+            for output_index, speaker_data in enumerate(speakers_to_process, start=1):
+                label = str(speaker_data.get("speaker_label", f"SPEAKER_{output_index:02d}"))
 
-            outputs: List[Dict[str, torch.Tensor | int]] = []
-            summary_items: List[str] = []
-            json_items: List[Dict[str, object]] = []
+                raw_segments = speaker_data.get("segments", [])
+                if not isinstance(raw_segments, list):
+                    raw_segments = []
 
-            for output_index, label in enumerate(ordered_labels[: cls.MAX_OUTPUT_SPEAKERS], start=1):
-                segments = merged_segments_map[label]
+                segments = [
+                    Segment(
+                        start=float(segment["start"]),
+                        end=float(segment["end"]),
+                    )
+                    for segment in raw_segments
+                    if isinstance(segment, dict)
+                    and "start" in segment
+                    and "end" in segment
+                ]
+
+                segments: List[Segment] = cls._merge_segments(segments, max_gap_seconds)
+
                 isolated_waveform = cls._build_masked_speaker_waveform(
                     source_waveform=original_waveform,
                     source_sample_rate=original_sample_rate,
@@ -374,13 +445,11 @@ class SpeakerDiarizerChronoNode:
                 )
 
                 if not keep_only_detected_speakers:
-                    # Mantido por compatibilidade semântica; o comportamento continua sendo
-                    # timeline-preserving com silêncio fora dos segmentos do speaker.
                     pass
 
                 outputs.append(cls._make_audio_output(isolated_waveform, original_sample_rate))
 
-                first_start = min(segment.start for segment in segments)
+                first_start = min((segment.start for segment in segments), default=0.0)
                 total_duration = sum(segment.duration for segment in segments)
 
                 summary_items.append(
@@ -412,7 +481,7 @@ class SpeakerDiarizerChronoNode:
             summary = "Speakers ordered by first appearance:\n" + "\n".join(summary_items)
             segments_json = json.dumps(
                 {
-                    "detected_speakers": len(ordered_labels),
+                    "detected_speakers": len(raw_speakers),
                     "returned_outputs": cls.MAX_OUTPUT_SPEAKERS,
                     "min_speakers": min_speakers,
                     "max_speakers": max_speakers,
@@ -446,5 +515,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SpeakerDiarizerChronoNode": "Speaker Diarizer Chrono (Up to 5 Speakers)",
+    "SpeakerDiarizerChronoNode": "Speaker Diarizer (Up to 5 Speakers)",
 }
